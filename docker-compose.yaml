@@ -1,0 +1,11 @@
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-bot-server
+    ports:
+      - "8443:8443"
+    environment:
+      - TELEGRAM_TOKEN=${BOT_API_TOKEN}
+      - WEBHOOK_URL=${WEBHOOK}
+      - PORT=8443
+      - EXPRESS_LOGIN_URL=${EXPRESS_LOGIN}
