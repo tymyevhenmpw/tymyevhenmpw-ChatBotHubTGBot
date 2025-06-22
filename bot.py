@@ -55,9 +55,9 @@ if not os.getenv("EXPRESS_USER_LOGIN_URL"):
 if not os.getenv("EXPRESS_USER_PROFILE_URL_BASE"):
     logger.warning("EXPRESS_USER_PROFILE_URL_BASE environment variable not set. Using default: %s", EXPRESS_USER_PROFILE_URL_BASE)
 
-app = None
+app = None # Global PTB application instance
 
-# --- Handlers (Defined BEFORE main) ---
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Handles the /start command. Greets the user and presents authentication options.
@@ -479,31 +479,24 @@ async def main():
         exit(1)
 
     aio_app = web.Application()
-    # It's good practice to define the handler functions before adding them to the router
     aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
     aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
 
-    runner = web.AppRunner(aio_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", LISTEN_PORT)
-    await site.start()
-    logger.info(f"Aiohttp server running on http://0.0.0.0:{LISTEN_PORT}")
-
-    await app.start() # Start the PTB application (webhook mode)
-    logger.info("Telegram Application started (listening for updates).")
-
-    # --- CRITICAL FIX: Use site.serve_forever() ---
+    # Instead of manual runner/site setup and serve_forever,
+    # let aiohttp's web.run_app handle it. This is simpler for containerized apps.
+    # It will block the current thread/task indefinitely.
+    logger.info(f"Starting aiohttp server on 0.0.0.0:{LISTEN_PORT}")
     try:
-        # This will block indefinitely, serving HTTP requests and keeping the event loop alive.
-        await site.serve_forever() # CORRECTED LINE: use site.serve_forever()
+        await web._run_app(aio_app, host="0.0.0.0", port=LISTEN_PORT)
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
         logger.info("Application shutdown requested by user (KeyboardInterrupt).")
     finally:
         logger.info("Stopping Telegram Application and cleaning up web server runner.")
-        await app.stop() # Stop PTB application
-        await runner.cleanup() # Clean up aiohttp runner resources
+        await app.stop() # Stop PTB application (if it's still running)
+        # web._run_app handles runner.cleanup() internally when it exits,
+        # but it's good practice to ensure app.stop() is called for PTB.
         logger.info("Application gracefully shut down.")
 
 if __name__ == "__main__":
