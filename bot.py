@@ -1,7 +1,7 @@
 import os
 import logging
 import json
-from aiohttp import web, ClientSession # Still need ClientSession for your Express API calls
+from aiohttp import web, ClientSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -29,7 +29,7 @@ LISTEN_PORT = int(os.getenv("PORT", "8080")) # Keep 8080 for Railway compatibili
 WEBHOOK_PATH = "/telegram/webhook" # PTB will use this path
 NOTIFY_WEBHOOK_PATH = "/notify" # Your custom notify endpoint
 
-EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
+EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_LOGIN", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
 EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
 
@@ -414,6 +414,12 @@ async def telegram_webhook_handler(request: web.Request):
 
     try:
         update_data = await request.json()
+        # Pass the update to the PTB application's update queue
+        # NOTE: With PTB 20.x and run_webhook, you generally don't need this manual
+        # handler for the *Telegram* webhook path. PTB adds its own internal handler.
+        # This function would only be needed if you were setting up the aiohttp
+        # server manually AND wanted to pass Telegram updates to PTB via app.update_queue.put().
+        # However, for your custom /notify endpoint, you need its explicit handler.
         logger.debug(f"Received Telegram webhook update: {update_data}")
         update = Update.de_json(update_data, app.bot)
         await app.update_queue.put(update)
@@ -471,10 +477,23 @@ async def main():
     await app.initialize()
     logger.info("Telegram Application initialized.")
 
-    # Create the aiohttp application separately to add custom routes
-    aio_app = web.Application()
-    aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
-    # The PTB run_webhook will add its handler for WEBHOOK_PATH internally
+    # --- Register custom HTTP handlers with PTB's webhook system ---
+    # PTB v20.x+ requires you to add *custom* webhook handlers via add_webhook_handler
+    # if you want them on the same server that PTB manages.
+    # We will pass the aiohttp.web.Application instance that PTB creates to these handlers.
+
+    async def custom_notify_webhook(request: web.Request):
+        """Wrapper for handle_notify to fit PTB's webhook handler signature if needed."""
+        # This function might not be strictly necessary if handle_notify itself
+        # can be directly registered as a aiohttp.web.View or a plain function
+        # that takes web.Request. Let's assume handle_notify is compatible.
+        return await handle_notify(request)
+
+    # Add your custom /notify endpoint to the webhook application that PTB will run
+    app.add_webhook_handler(NOTIFY_WEBHOOK_PATH, custom_notify_webhook)
+    logger.info(f"Custom HTTP endpoint registered: {NOTIFY_WEBHOOK_PATH}")
+
+    # No need to explicitly add telegram_webhook_handler. PTB handles its own webhook route.
 
     logger.info(f"Starting Telegram Application in webhook mode (HTTP server on 0.0.0.0:{LISTEN_PORT}).")
     logger.info(f"Telegram webhook URL will be: {WEBHOOK_URL}{WEBHOOK_PATH}")
@@ -484,19 +503,16 @@ async def main():
         await app.run_webhook(
             listen="0.0.0.0",
             port=LISTEN_PORT,
-            url_path=WEBHOOK_PATH,
-            webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
-            web_app=aio_app, 
+            url_path=WEBHOOK_PATH, # This is the path Telegram sends updates to
+            webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}", # This is the full URL Telegram is set to
+            # web_app is removed in PTB 20.x, handlers are added via app.add_webhook_handler
         )
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
         logger.info("Application shutdown requested by user (KeyboardInterrupt).")
     finally:
-        # IMPORTANT: app.run_webhook() handles the stopping of the PTB Application itself.
-        # Calling app.stop() again here will raise "RuntimeError: This Application is not running!"
         logger.info("Application shutdown initiated.")
-        # Removed: await app.stop() 
         logger.info("Application gracefully shut down.")
 
 if __name__ == "__main__":
