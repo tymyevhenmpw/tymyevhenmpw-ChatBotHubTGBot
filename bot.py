@@ -474,11 +474,7 @@ async def main():
     # Create the aiohttp application separately to add custom routes
     aio_app = web.Application()
     aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
-
-    # Instead of manual webhook setup, let PTB handle its webhook.
-    # PTB's run_webhook will take over starting and managing the aiohttp server.
-    # We pass our custom aio_app to PTB so it can integrate its webhook handler
-    # into our existing aiohttp application.
+    # The PTB run_webhook will add its handler for WEBHOOK_PATH internally
 
     logger.info(f"Starting Telegram Application in webhook mode (HTTP server on 0.0.0.0:{LISTEN_PORT}).")
     logger.info(f"Telegram webhook URL will be: {WEBHOOK_URL}{WEBHOOK_PATH}")
@@ -490,18 +486,17 @@ async def main():
             port=LISTEN_PORT,
             url_path=WEBHOOK_PATH,
             webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
-            # Pass our custom aiohttp app to PTB so it integrates
-            # into our existing server, including the /notify endpoint.
             web_app=aio_app, 
-            # You can optionally set the PTB application up to be shut down
-            # when the web app is shut down.
-            # shutdown_event=aio_app.on_shutdown
         )
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
         logger.info("Application shutdown requested by user (KeyboardInterrupt).")
     finally:
+        # IMPORTANT: app.run_webhook() handles the stopping of the PTB Application itself.
+        # Calling app.stop() again here will raise "RuntimeError: This Application is not running!"
+        logger.info("Application shutdown initiated.")
+        # Removed: await app.stop() 
         logger.info("Application gracefully shut down.")
 
 if __name__ == "__main__":
