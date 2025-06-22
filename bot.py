@@ -1,7 +1,7 @@
 import os
 import logging
 import json
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession # Still need ClientSession for your Express API calls
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://xxxx.up.railway.app
 LISTEN_PORT = int(os.getenv("PORT", "8080")) # Keep 8080 for Railway compatibility
-WEBHOOK_PATH = "/telegram/webhook"
-NOTIFY_WEBHOOK_PATH = "/notify"
+WEBHOOK_PATH = "/telegram/webhook" # PTB will use this path
+NOTIFY_WEBHOOK_PATH = "/notify" # Your custom notify endpoint
 
 EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
@@ -425,6 +425,7 @@ async def telegram_webhook_handler(request: web.Request):
         logger.exception(f"Error processing Telegram webhook: {e}")
         return web.Response(status=500, text="Internal Server Error")
 
+
 # --- Main application setup and execution ---
 async def main():
     """
@@ -466,37 +467,41 @@ async def main():
 
     app.add_handler(conv_handler)
 
+    # Initialize the PTB application; it also creates the HTTPX client for Telegram API
     await app.initialize()
     logger.info("Telegram Application initialized.")
 
-    full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-    logger.info(f"Setting Telegram webhook to: {full_webhook_url}")
-    try:
-        await app.bot.set_webhook(url=full_webhook_url)
-        logger.info("Telegram webhook set successfully.")
-    except Exception as e:
-        logger.error(f"Failed to set Telegram webhook: {e}. Ensure WEBHOOK_URL is reachable.")
-        exit(1)
-
+    # Create the aiohttp application separately to add custom routes
     aio_app = web.Application()
     aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
-    aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
 
-    # Instead of manual runner/site setup and serve_forever,
-    # let aiohttp's web.run_app handle it. This is simpler for containerized apps.
-    # It will block the current thread/task indefinitely.
-    logger.info(f"Starting aiohttp server on 0.0.0.0:{LISTEN_PORT}")
+    # Instead of manual webhook setup, let PTB handle its webhook.
+    # PTB's run_webhook will take over starting and managing the aiohttp server.
+    # We pass our custom aio_app to PTB so it can integrate its webhook handler
+    # into our existing aiohttp application.
+
+    logger.info(f"Starting Telegram Application in webhook mode (HTTP server on 0.0.0.0:{LISTEN_PORT}).")
+    logger.info(f"Telegram webhook URL will be: {WEBHOOK_URL}{WEBHOOK_PATH}")
+
     try:
-        await web._run_app(aio_app, host="0.0.0.0", port=LISTEN_PORT)
+        # This is the most reliable way: Let PTB manage the web server lifecycle
+        await app.run_webhook(
+            listen="0.0.0.0",
+            port=LISTEN_PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+            # Pass our custom aiohttp app to PTB so it integrates
+            # into our existing server, including the /notify endpoint.
+            web_app=aio_app, 
+            # You can optionally set the PTB application up to be shut down
+            # when the web app is shut down.
+            # shutdown_event=aio_app.on_shutdown
+        )
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
         logger.info("Application shutdown requested by user (KeyboardInterrupt).")
     finally:
-        logger.info("Stopping Telegram Application and cleaning up web server runner.")
-        await app.stop() # Stop PTB application (if it's still running)
-        # web._run_app handles runner.cleanup() internally when it exits,
-        # but it's good practice to ensure app.stop() is called for PTB.
         logger.info("Application gracefully shut down.")
 
 if __name__ == "__main__":
