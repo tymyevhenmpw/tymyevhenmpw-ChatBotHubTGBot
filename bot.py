@@ -5,6 +5,7 @@ from aiohttp import web, ClientSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -33,7 +34,6 @@ EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.dock
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
 EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
 
-
 # --- Conversation States ---
 AUTH_CHOICE, GET_STAFF_EMAIL, GET_STAFF_PASSWORD, GET_OWNER_EMAIL, GET_OWNER_PASSWORD = range(5)
 
@@ -54,8 +54,6 @@ if not os.getenv("EXPRESS_USER_LOGIN_URL"):
     logger.warning("EXPRESS_USER_LOGIN_URL environment variable not set. Using default: %s", EXPRESS_USER_LOGIN_URL)
 if not os.getenv("EXPRESS_USER_PROFILE_URL_BASE"):
     logger.warning("EXPRESS_USER_PROFILE_URL_BASE environment variable not set. Using default: %s", EXPRESS_USER_PROFILE_URL_BASE)
-
-app = None # Global PTB application instance
 
 # --- Handlers for Telegram Bot ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -98,7 +96,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     user_id = query.from_user.id
-    chat_id = query.message.chat_id
     data = query.data
 
     if data == "auth_owner":
@@ -324,7 +321,8 @@ async def get_staff_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Please try again later or contact support\\. You can /cancel this process\\.",
             parse_mode=ParseMode.MARKDOWN_V2
         )
-        return ConversationHandler.END
+    return ConversationHandler.END
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
@@ -339,11 +337,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info(f"User {user_id} cancelled the authentication process.")
     return ConversationHandler.END
 
+# --- Web Server Handlers ---
+
 async def handle_notify(request: web.Request):
     """
     Handles incoming POST requests to the /notify endpoint.
     Sends messages to authorized owners and staff based on the request payload.
     """
+    ptb_app = request.app['ptb_app']
     try:
         data = await request.json()
         logger.info(f"Received notification request: {data}")
@@ -362,7 +363,7 @@ async def handle_notify(request: web.Request):
         return web.json_response({"status": "error", "message": "Missing 'message' in payload"}, status=400)
 
     escaped_message_text = escape_markdown(message_text, version=2)
-    escaped_websiteId = escape_markdown(websiteId, version=2)
+    escaped_websiteId = escape_markdown(str(websiteId), version=2)
 
     # Message format for both owner and staff
     full_message = f"💬 New message on website ID: `{escaped_websiteId}`\n`{escaped_message_text}`"
@@ -376,7 +377,7 @@ async def handle_notify(request: web.Request):
         
         if owner_chat_id_to_notify:
             try:
-                await app.bot.send_message(owner_chat_id_to_notify, full_message, parse_mode=ParseMode.MARKDOWN_V2)
+                await ptb_app.bot.send_message(owner_chat_id_to_notify, full_message, parse_mode=ParseMode.MARKDOWN_V2)
                 logger.info(f"Message sent to owner Express User ID: {owner_id_from_payload} (Telegram Chat ID: {owner_chat_id_to_notify}) as notifyOwner flag was True.")
             except Exception as e:
                 logger.error(f"Error sending message to owner {owner_id_from_payload} ({owner_chat_id_to_notify}): {e}")
@@ -389,9 +390,9 @@ async def handle_notify(request: web.Request):
         
         notified_staff_count = 0
         for chat_id, staff_info in AUTHENTICATED_STAFF_DETAILS.items():
-            if staff_info.get("website_id") == websiteId:
+            if str(staff_info.get("website_id")) == str(websiteId):
                 try:
-                    await app.bot.send_message(chat_id, full_message, parse_mode=ParseMode.MARKDOWN_V2)
+                    await ptb_app.bot.send_message(chat_id, full_message, parse_mode=ParseMode.MARKDOWN_V2)
                     logger.info(f"Message sent to staff '{staff_info.get('email')}' ({chat_id}) for website {websiteId}.")
                     notified_staff_count += 1
                 except Exception as e:
@@ -408,18 +409,13 @@ async def telegram_webhook_handler(request: web.Request):
     Handles incoming Telegram updates when a custom web server is used.
     This function processes the update and passes it to the PTB application.
     """
-    global app
-    if app is None:
-        logger.error("Telegram Application is not initialized. Cannot process webhook.")
-        return web.Response(status=500, text="Bot not ready")
-
+    ptb_app = request.app['ptb_app']
     try:
         update_data = await request.json()
         logger.debug(f"Received Telegram webhook update: {update_data}")
-        update = Update.de_json(update_data, app.bot)
+        update = Update.de_json(update_data, ptb_app.bot)
         
-        # Process the update using the PTB application
-        await app.process_update(update) 
+        await ptb_app.process_update(update) 
         
         return web.Response(status=200)
     except json.JSONDecodeError:
@@ -431,19 +427,14 @@ async def telegram_webhook_handler(request: web.Request):
 
 
 # --- Main application setup and execution ---
-async def main():
-    """
-    Main function to set up the Telegram bot and the aiohttp web server.
-    """
-    global app
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .read_timeout(7)
-        .write_timeout(7)
-        .build()
-    )
+async def on_startup(app: web.Application):
+    """
+    Function to run on web server startup.
+    Initializes the PTB application and sets the webhook.
+    """
+    logger.info("Web server starting up...")
+    ptb_app = Application.builder().token(BOT_TOKEN).read_timeout(7).write_timeout(7).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -468,55 +459,52 @@ async def main():
         per_user=True,
         allow_reentry=True,
     )
-
-    app.add_handler(conv_handler)
-
-    # Initialize the PTB application; this prepares it to handle updates
-    await app.initialize()
+    ptb_app.add_handler(conv_handler)
+    
+    await ptb_app.initialize()
     logger.info("Telegram Application initialized.")
 
-    # --- Set up the aiohttp web application ---
-    aio_app = web.Application()
-
-    # Add your custom /notify endpoint
-    aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
-    logger.info(f"Custom HTTP endpoint registered: {NOTIFY_WEBHOOK_PATH}")
-
-    # Add the Telegram webhook endpoint, which will manually pass updates to PTB
-    aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
-    logger.info(f"Telegram webhook endpoint registered: {WEBHOOK_PATH}")
-
-    # Set the webhook URL with Telegram Bot API
     full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     logger.info(f"Setting Telegram webhook to: {full_webhook_url}")
     try:
-        await app.bot.set_webhook(url=full_webhook_url)
+        await ptb_app.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
         logger.info("Telegram webhook set successfully.")
     except Exception as e:
         logger.error(f"Failed to set Telegram webhook: {e}. Ensure WEBHOOK_URL is reachable.")
-        exit(1)
+        # We don't exit here, to allow the server to run for debugging,
+        # but webhook functionality will be broken.
 
-    # --- Start the aiohttp web server ---
-    # This is the standard way to run an aiohttp app and will block indefinitely
-    logger.info(f"Starting aiohttp server on 0.0.0.0:{LISTEN_PORT}")
-    try:
-        await web._run_app(aio_app, host="0.0.0.0", port=LISTEN_PORT)
-    except asyncio.CancelledError:
-        logger.info("Application shutdown requested via asyncio.CancelledError.")
-    except KeyboardInterrupt:
-        logger.info("Application shutdown requested by user (KeyboardInterrupt).")
-    finally:
-        logger.info("Application shutdown initiated.")
-        # When web._run_app exits, it implies the server is no longer running.
-        # It also handles runner.cleanup() internally.
-        # We need to explicitly stop the PTB application.
-        # This time, app.stop() should be safe, as it's not managed by run_webhook().
-        logger.info("Stopping Telegram Application.")
-        await app.stop() # Explicitly stop the PTB application
-        logger.info("Application gracefully shut down.")
+    # Store the PTB application instance in the aiohttp app context
+    app['ptb_app'] = ptb_app
+
+
+async def on_shutdown(app: web.Application):
+    """
+    Function to run on web server shutdown.
+    Stops the PTB application.
+    """
+    logger.info("Web server shutting down...")
+    ptb_app = app['ptb_app']
+    await ptb_app.stop()
+    logger.info("Telegram Application stopped.")
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.exception("An unhandled error occurred during application startup or runtime.")
+    aio_app = web.Application()
+    
+    # Register lifecycle hooks
+    aio_app.on_startup.append(on_startup)
+    aio_app.on_shutdown.append(on_shutdown)
+    
+    # Register request handlers
+    aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
+    aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
+
+    logger.info(f"Custom HTTP endpoint will be registered at: {NOTIFY_WEBHOOK_PATH}")
+    logger.info(f"Telegram webhook endpoint will be registered at: {WEBHOOK_PATH}")
+    
+    # THIS IS THE KEY CHANGE:
+    # Use the blocking web.run_app to start the server.
+    # It handles the asyncio event loop and keeps the process alive.
+    logger.info(f"Starting aiohttp server on 0.0.0.0:{LISTEN_PORT}")
+    web.run_app(aio_app, host="0.0.0.0", port=LISTEN_PORT)
