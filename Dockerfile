@@ -15,9 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 
 #
-# --- THIS IS THE FINAL CMD INSTRUCTION ---
+# --- THIS IS THE CRITICAL CHANGE ---
 #
-# Use Gunicorn with the Uvicorn worker to run the app from the create_app factory.
-# The quotes around "bot:create_app()" are important.
+# Use Gunicorn to run the application.
+# This CMD instruction uses the shell form to properly substitute the $PORT variable
+# provided by the Railway environment. 'exec' ensures Gunicorn runs as the main process.
 #
-CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 -k uvicorn.workers.UvicornWorker "bot:create_app()"
+CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 0 bot:app
