@@ -1,7 +1,8 @@
 import os
 import logging
 import json
-from aiohttp import web, ClientSession
+import asyncio
+from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -15,13 +16,16 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
-import asyncio
+from aiohttp import ClientSession # Still using aiohttp for outgoing requests
 
 # --- Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# --- Flask App Initialization ---
+app = Flask(__name__)
 
 # --- Environment ---
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -37,9 +41,10 @@ EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http
 # --- Conversation States ---
 AUTH_CHOICE, GET_STAFF_EMAIL, GET_STAFF_PASSWORD, GET_OWNER_EMAIL, GET_OWNER_PASSWORD = range(5)
 
-# --- Data Stores ---
+# --- Data Stores (Global) ---
 AUTHORIZED = {}
 AUTHENTICATED_STAFF_DETAILS = {}
+ptb_app: Application = None # Global variable to hold the PTB application instance
 
 # --- Environment Variable Checks ---
 if not BOT_TOKEN:
@@ -55,7 +60,7 @@ if not os.getenv("EXPRESS_USER_LOGIN_URL"):
 if not os.getenv("EXPRESS_USER_PROFILE_URL_BASE"):
     logger.warning("EXPRESS_USER_PROFILE_URL_BASE environment variable not set. Using default: %s", EXPRESS_USER_PROFILE_URL_BASE)
 
-# --- Handlers for Telegram Bot ---
+# --- Handlers for Telegram Bot (Identical to original) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Handles the /start command. Greets the user and presents authentication options.
@@ -323,7 +328,6 @@ async def get_staff_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     return ConversationHandler.END
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Cancels the current conversation.
@@ -337,105 +341,110 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info(f"User {user_id} cancelled the authentication process.")
     return ConversationHandler.END
 
-# --- Web Server Handlers ---
+# --- Flask Web Server Routes ---
 
-async def handle_notify(request: web.Request):
+@app.route(NOTIFY_WEBHOOK_PATH, methods=['POST'])
+def handle_notify_route():
     """
-    Handles incoming POST requests to the /notify endpoint.
+    Flask route to handle incoming POST requests to the /notify endpoint.
     Sends messages to authorized owners and staff based on the request payload.
     """
-    ptb_app = request.app['ptb_app']
     try:
-        data = await request.json()
+        data = request.get_json()
         logger.info(f"Received notification request: {data}")
     except Exception as e:
         logger.error(f"Invalid JSON in notify request: {e}")
-        return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+        return {"status": "error", "message": "Invalid JSON"}, 400
 
     message_text = data.get("message")
     websiteId = data.get("websiteId", "N/A")
-    notify_owner = data.get("notifyOwner", False) # Flag controlled by sender (main-service)
+    notify_owner = data.get("notifyOwner", False)
     notify_all_staff = data.get("notifyAllStaff", False)
-    owner_id_from_payload = data.get("ownerId") # The backend User _id sent from main-service
+    owner_id_from_payload = data.get("ownerId")
 
     if not message_text:
         logger.warning("Notification request missing 'message' field.")
-        return web.json_response({"status": "error", "message": "Missing 'message' in payload"}, status=400)
+        return {"status": "error", "message": "Missing 'message' in payload"}, 400
 
+    asyncio.run(process_notification(
+        message_text,
+        websiteId,
+        notify_owner,
+        notify_all_staff,
+        owner_id_from_payload
+    ))
+
+    return {"status": "ok", "message": "Notification processed"}
+
+async def process_notification(message_text, websiteId, notify_owner, notify_all_staff, owner_id_from_payload):
+    """
+    Asynchronous helper to send notifications.
+    """
+    global ptb_app
     escaped_message_text = escape_markdown(message_text, version=2)
     escaped_websiteId = escape_markdown(str(websiteId), version=2)
-
-    # Message format for both owner and staff
     full_message = f"💬 New message on website ID: `{escaped_websiteId}`\n`{escaped_message_text}`"
 
     if notify_owner and owner_id_from_payload:
         owner_chat_id_to_notify = None
-        for telegram_user_id_key, owner_info_dict in AUTHORIZED.items():
-            if owner_info_dict.get("user_id") == owner_id_from_payload:
-                owner_chat_id_to_notify = owner_info_dict.get("chat_id")
+        for telegram_user_id, owner_info in AUTHORIZED.items():
+            if owner_info.get("user_id") == owner_id_from_payload:
+                owner_chat_id_to_notify = owner_info.get("chat_id")
                 break
         
         if owner_chat_id_to_notify:
             try:
                 await ptb_app.bot.send_message(owner_chat_id_to_notify, full_message, parse_mode=ParseMode.MARKDOWN_V2)
-                logger.info(f"Message sent to owner Express User ID: {owner_id_from_payload} (Telegram Chat ID: {owner_chat_id_to_notify}) as notifyOwner flag was True.")
+                logger.info(f"Message sent to owner (Express User ID: {owner_id_from_payload})")
             except Exception as e:
-                logger.error(f"Error sending message to owner {owner_id_from_payload} ({owner_chat_id_to_notify}): {e}")
+                logger.error(f"Error sending message to owner {owner_id_from_payload}: {e}")
         else:
-            logger.warning(f"Notify owner requested (Express User ID: {owner_id_from_payload}), but corresponding Telegram chat_id not found in AUTHORIZED mapping.")
+            logger.warning(f"Notify owner requested, but no matching owner found for Express User ID: {owner_id_from_payload}")
 
     if notify_all_staff:
         if not AUTHENTICATED_STAFF_DETAILS:
             logger.warning("Notify all staff requested, but no staff are authenticated.")
         
-        notified_staff_count = 0
         for chat_id, staff_info in AUTHENTICATED_STAFF_DETAILS.items():
             if str(staff_info.get("website_id")) == str(websiteId):
                 try:
                     await ptb_app.bot.send_message(chat_id, full_message, parse_mode=ParseMode.MARKDOWN_V2)
-                    logger.info(f"Message sent to staff '{staff_info.get('email')}' ({chat_id}) for website {websiteId}.")
-                    notified_staff_count += 1
+                    logger.info(f"Message sent to staff '{staff_info.get('email')}' for website {websiteId}.")
                 except Exception as e:
-                    logger.error(f"Error sending message to staff {staff_info.get('email')} ({chat_id}): {e}")
-        
-        if notified_staff_count == 0:
-            logger.warning(f"No staff found for website '{websiteId}' to notify, or no staff authenticated at all.")
+                    logger.error(f"Error sending message to staff {staff_info.get('email')}: {e}")
 
-    return web.json_response({"status": "ok", "message": "Notification processed"})
-
-
-async def telegram_webhook_handler(request: web.Request):
+@app.route(WEBHOOK_PATH, methods=['POST'])
+def telegram_webhook_handler_route():
     """
-    Handles incoming Telegram updates when a custom web server is used.
+    Flask route that handles incoming Telegram updates.
     This function processes the update and passes it to the PTB application.
     """
-    ptb_app = request.app['ptb_app']
+    global ptb_app
     try:
-        update_data = await request.json()
+        update_data = request.get_json(force=True)
         logger.debug(f"Received Telegram webhook update: {update_data}")
         update = Update.de_json(update_data, ptb_app.bot)
-        
-        await ptb_app.process_update(update) 
-        
-        return web.Response(status=200)
+
+        # Process the update asynchronously
+        asyncio.run(ptb_app.process_update(update))
+
+        return Response(status=200)
     except json.JSONDecodeError:
         logger.error("Failed to decode JSON from Telegram webhook request.")
-        return web.Response(status=400, text="Invalid JSON")
+        return Response("Invalid JSON", status=400)
     except Exception as e:
         logger.exception(f"Error processing Telegram webhook: {e}")
-        return web.Response(status=500, text="Internal Server Error")
-
+        return Response("Internal Server Error", status=500)
 
 # --- Main application setup and execution ---
-
-async def on_startup(app: web.Application):
-    """
-    Function to run on web server startup.
-    Initializes the PTB application and sets the webhook.
-    """
-    logger.info("Web server starting up...")
+if __name__ == "__main__":
+    # This block runs only when the script is executed directly
+    
+    # Initialize the PTB Application
+    logger.info("Initializing Telegram Application...")
     ptb_app = Application.builder().token(BOT_TOKEN).read_timeout(7).write_timeout(7).build()
-
+    
+    # Define the conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -459,52 +468,26 @@ async def on_startup(app: web.Application):
         per_user=True,
         allow_reentry=True,
     )
+    
+    # Add handlers to the application
     ptb_app.add_handler(conv_handler)
     
-    await ptb_app.initialize()
-    logger.info("Telegram Application initialized.")
-
-    full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-    logger.info(f"Setting Telegram webhook to: {full_webhook_url}")
+    # Set the Telegram webhook
+    # This is run in a temporary event loop before the Flask app starts.
     try:
-        await ptb_app.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
+        full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+        logger.info(f"Setting Telegram webhook to: {full_webhook_url}")
+        asyncio.run(ptb_app.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES))
         logger.info("Telegram webhook set successfully.")
     except Exception as e:
-        logger.error(f"Failed to set Telegram webhook: {e}. Ensure WEBHOOK_URL is reachable.")
-        # We don't exit here, to allow the server to run for debugging,
-        # but webhook functionality will be broken.
+        logger.error(f"Failed to set Telegram webhook: {e}. Ensure WEBHOOK_URL is reachable from the internet.")
+        exit(1) # Exit if webhook setup fails, as the bot will not function.
 
-    # Store the PTB application instance in the aiohttp app context
-    app['ptb_app'] = ptb_app
-
-
-async def on_shutdown(app: web.Application):
-    """
-    Function to run on web server shutdown.
-    Stops the PTB application.
-    """
-    logger.info("Web server shutting down...")
-    ptb_app = app['ptb_app']
-    await ptb_app.stop()
-    logger.info("Telegram Application stopped.")
-
-
-if __name__ == "__main__":
-    aio_app = web.Application()
+    # Start the Flask web server
+    logger.info(f"Starting Flask server on 0.0.0.0:{LISTEN_PORT}")
+    logger.info(f"Custom HTTP endpoint will be at: {NOTIFY_WEBHOOK_PATH}")
+    logger.info(f"Telegram webhook endpoint is at: {WEBHOOK_PATH}")
     
-    # Register lifecycle hooks
-    aio_app.on_startup.append(on_startup)
-    aio_app.on_shutdown.append(on_shutdown)
-    
-    # Register request handlers
-    aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
-    aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
-
-    logger.info(f"Custom HTTP endpoint will be registered at: {NOTIFY_WEBHOOK_PATH}")
-    logger.info(f"Telegram webhook endpoint will be registered at: {WEBHOOK_PATH}")
-    
-    # THIS IS THE KEY CHANGE:
-    # Use the blocking web.run_app to start the server.
-    # It handles the asyncio event loop and keeps the process alive.
-    logger.info(f"Starting aiohttp server on 0.0.0.0:{LISTEN_PORT}")
-    web.run_app(aio_app, host="0.0.0.0", port=LISTEN_PORT)
+    # Use a production-ready WSGI server like gunicorn or waitress in production
+    # For example: gunicorn --bind 0.0.0.0:8080 flask_bot:app
+    app.run(host="0.0.0.0", port=LISTEN_PORT)
