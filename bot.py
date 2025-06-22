@@ -29,7 +29,6 @@ LISTEN_PORT = int(os.getenv("PORT", "8080")) # Keep 8080 for Railway compatibili
 WEBHOOK_PATH = "/telegram/webhook"
 NOTIFY_WEBHOOK_PATH = "/notify"
 
-# Ensure these environment variables are set in Railway, or their defaults will be used
 EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
 EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
@@ -58,7 +57,7 @@ if not os.getenv("EXPRESS_USER_PROFILE_URL_BASE"):
 
 app = None
 
-# --- Handlers ---
+# --- Handlers (Defined BEFORE main) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Handles the /start command. Greets the user and presents authentication options.
@@ -403,6 +402,29 @@ async def handle_notify(request: web.Request):
 
     return web.json_response({"status": "ok", "message": "Notification processed"})
 
+
+async def telegram_webhook_handler(request: web.Request):
+    """
+    A custom aiohttp handler to receive Telegram updates and pass them to the PTB application.
+    """
+    global app
+    if app is None:
+        logger.error("Telegram Application is not initialized. Cannot process webhook.")
+        return web.Response(status=500, text="Bot not ready")
+
+    try:
+        update_data = await request.json()
+        logger.debug(f"Received Telegram webhook update: {update_data}")
+        update = Update.de_json(update_data, app.bot)
+        await app.update_queue.put(update)
+        return web.Response(status=200)
+    except json.JSONDecodeError:
+        logger.error("Failed to decode JSON from Telegram webhook request.")
+        return web.Response(status=400, text="Invalid JSON")
+    except Exception as e:
+        logger.exception(f"Error processing Telegram webhook: {e}")
+        return web.Response(status=500, text="Internal Server Error")
+
 # --- Main application setup and execution ---
 async def main():
     """
@@ -457,6 +479,7 @@ async def main():
         exit(1)
 
     aio_app = web.Application()
+    # It's good practice to define the handler functions before adding them to the router
     aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
     aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
 
