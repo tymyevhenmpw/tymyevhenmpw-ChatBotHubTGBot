@@ -25,14 +25,11 @@ logger = logging.getLogger(__name__)
 # --- Environment ---
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://xxxx.up.railway.app
-# Changed LISTEN_PORT to 8080, which is Railway's typical exposed port
-LISTEN_PORT = int(os.getenv("PORT", "8080")) 
+LISTEN_PORT = int(os.getenv("PORT", "8080")) # Keep 8080 for Railway compatibility
 WEBHOOK_PATH = "/telegram/webhook"
 NOTIFY_WEBHOOK_PATH = "/notify"
 
 # Ensure these environment variables are set in Railway, or their defaults will be used
-# If EXPRESS_LOGIN_URL is for both staff and user, you might want to rename it for clarity
-# or pass specific login URLs from Railway variables.
 EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
 EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
@@ -42,9 +39,7 @@ EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http
 AUTH_CHOICE, GET_STAFF_EMAIL, GET_STAFF_PASSWORD, GET_OWNER_EMAIL, GET_OWNER_PASSWORD = range(5)
 
 # --- Data Stores ---
-# AUTHORIZED stores telegram_user_id (key) : {"chat_id": telegram_chat_id, "user_id": express_user_id, "token": jwt_token, "email": email}
 AUTHORIZED = {}
-# AUTHENTICATED_STAFF_DETAILS stores telegram_chat_id (key) : {"staff_id": ..., "email": ..., "website_id": ..., "name": ..., "token": ...}
 AUTHENTICATED_STAFF_DETAILS = {}
 
 # --- Environment Variable Checks ---
@@ -493,23 +488,21 @@ async def main():
     await site.start()
     logger.info(f"Aiohttp server running on http://0.0.0.0:{LISTEN_PORT}")
 
-    await app.start()
+    await app.start() # Start the PTB application (webhook mode)
     logger.info("Telegram Application started (listening for updates).")
 
-    # This is the crucial part to keep the container alive
+    # --- Crucial Change: Use runner.serve_forever() to keep the server/container alive ---
     try:
-        # This loop will keep the main asyncio task alive indefinitely
-        # allowing the aiohttp server to listen for webhooks and the PTB app to process updates.
-        while True:
-            await asyncio.sleep(3600) # Sleep for 1 hour, then repeat. This keeps the loop active.
+        # This will block indefinitely, serving HTTP requests and keeping the event loop alive.
+        await runner.serve_forever() 
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
         logger.info("Application shutdown requested by user (KeyboardInterrupt).")
     finally:
         logger.info("Stopping Telegram Application and cleaning up web server runner.")
-        await app.stop()
-        await runner.cleanup()
+        await app.stop() # Stop PTB application
+        await runner.cleanup() # Clean up aiohttp runner resources
         logger.info("Application gracefully shut down.")
 
 if __name__ == "__main__":
