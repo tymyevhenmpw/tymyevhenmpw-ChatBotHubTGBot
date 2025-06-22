@@ -343,6 +343,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 # --- Flask Web Server Routes ---
 
+@app.route("/")
+def health_check():
+    """
+    A simple health check endpoint that hosting platforms can use.
+    Responds with a 200 OK status to indicate the app is live.
+    """
+    logger.info("Health check endpoint was hit.")
+    return "OK", 200
+    
 @app.route(NOTIFY_WEBHOOK_PATH, methods=['POST'])
 def handle_notify_route():
     """
