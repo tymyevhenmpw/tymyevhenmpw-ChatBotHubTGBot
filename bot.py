@@ -403,28 +403,6 @@ async def handle_notify(request: web.Request):
 
     return web.json_response({"status": "ok", "message": "Notification processed"})
 
-async def telegram_webhook_handler(request: web.Request):
-    """
-    A custom aiohttp handler to receive Telegram updates and pass them to the PTB application.
-    """
-    global app
-    if app is None:
-        logger.error("Telegram Application is not initialized. Cannot process webhook.")
-        return web.Response(status=500, text="Bot not ready")
-
-    try:
-        update_data = await request.json()
-        logger.debug(f"Received Telegram webhook update: {update_data}")
-        update = Update.de_json(update_data, app.bot)
-        await app.update_queue.put(update)
-        return web.Response(status=200)
-    except json.JSONDecodeError:
-        logger.error("Failed to decode JSON from Telegram webhook request.")
-        return web.Response(status=400, text="Invalid JSON")
-    except Exception as e:
-        logger.exception(f"Error processing Telegram webhook: {e}")
-        return web.Response(status=500, text="Internal Server Error")
-
 # --- Main application setup and execution ---
 async def main():
     """
@@ -491,10 +469,10 @@ async def main():
     await app.start() # Start the PTB application (webhook mode)
     logger.info("Telegram Application started (listening for updates).")
 
-    # --- Crucial Change: Use runner.serve_forever() to keep the server/container alive ---
+    # --- CRITICAL FIX: Use site.serve_forever() ---
     try:
         # This will block indefinitely, serving HTTP requests and keeping the event loop alive.
-        await runner.serve_forever() 
+        await site.serve_forever() # CORRECTED LINE: use site.serve_forever()
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
