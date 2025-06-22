@@ -24,13 +24,19 @@ logger = logging.getLogger(__name__)
 
 # --- Environment ---
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://xxxx.ngrok-free.app
-LISTEN_PORT = int(os.getenv("PORT", "8443"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://xxxx.up.railway.app
+# Changed LISTEN_PORT to 8080, which is Railway's typical exposed port
+LISTEN_PORT = int(os.getenv("PORT", "8080")) 
 WEBHOOK_PATH = "/telegram/webhook"
 NOTIFY_WEBHOOK_PATH = "/notify"
+
+# Ensure these environment variables are set in Railway, or their defaults will be used
+# If EXPRESS_LOGIN_URL is for both staff and user, you might want to rename it for clarity
+# or pass specific login URLs from Railway variables.
 EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
 EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
+
 
 # --- Conversation States ---
 AUTH_CHOICE, GET_STAFF_EMAIL, GET_STAFF_PASSWORD, GET_OWNER_EMAIL, GET_OWNER_PASSWORD = range(5)
@@ -41,6 +47,7 @@ AUTHORIZED = {}
 # AUTHENTICATED_STAFF_DETAILS stores telegram_chat_id (key) : {"staff_id": ..., "email": ..., "website_id": ..., "name": ..., "token": ...}
 AUTHENTICATED_STAFF_DETAILS = {}
 
+# --- Environment Variable Checks ---
 if not BOT_TOKEN:
     logger.error("TELEGRAM_TOKEN environment variable not set. Exiting.")
     exit(1)
@@ -314,7 +321,7 @@ async def get_staff_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         parse_mode=ParseMode.MARKDOWN_V2
                     )
                     logger.warning(f"Staff {email} ({user_id}) login failed: {error_message} (Status: {response.status}).")
-                    return GET_STAFF_EMAIL
+                    return GET_STAFF_PASSWORD
 
     except Exception as e:
         logger.exception(f"Error communicating with Express server for staff login from {user_id}: {e}")
@@ -366,17 +373,12 @@ async def handle_notify(request: web.Request):
     # Message format for both owner and staff
     full_message = f"💬 New message on website ID: `{escaped_websiteId}`\n`{escaped_message_text}`"
 
-
-    # FIX: Logic to notify owner: Rely solely on notify_owner flag and correct data access
     if notify_owner and owner_id_from_payload:
         owner_chat_id_to_notify = None
-        # Iterate AUTHORIZED.values() which gives us the stored info dicts
-        # FIX: Find the owner_info dict by matching the backend user_id (owner_id_from_payload)
-        # to the 'user_id' stored in the owner_info dict.
-        for telegram_user_id_key, owner_info_dict in AUTHORIZED.items(): # Use more descriptive variable names
+        for telegram_user_id_key, owner_info_dict in AUTHORIZED.items():
             if owner_info_dict.get("user_id") == owner_id_from_payload:
                 owner_chat_id_to_notify = owner_info_dict.get("chat_id")
-                break # Found the owner, break the loop
+                break
         
         if owner_chat_id_to_notify:
             try:
@@ -386,7 +388,6 @@ async def handle_notify(request: web.Request):
                 logger.error(f"Error sending message to owner {owner_id_from_payload} ({owner_chat_id_to_notify}): {e}")
         else:
             logger.warning(f"Notify owner requested (Express User ID: {owner_id_from_payload}), but corresponding Telegram chat_id not found in AUTHORIZED mapping.")
-
 
     if notify_all_staff:
         if not AUTHENTICATED_STAFF_DETAILS:
@@ -495,8 +496,12 @@ async def main():
     await app.start()
     logger.info("Telegram Application started (listening for updates).")
 
+    # This is the crucial part to keep the container alive
     try:
-        await asyncio.Event().wait()
+        # This loop will keep the main asyncio task alive indefinitely
+        # allowing the aiohttp server to listen for webhooks and the PTB app to process updates.
+        while True:
+            await asyncio.sleep(3600) # Sleep for 1 hour, then repeat. This keeps the loop active.
     except asyncio.CancelledError:
         logger.info("Application shutdown requested via asyncio.CancelledError.")
     except KeyboardInterrupt:
