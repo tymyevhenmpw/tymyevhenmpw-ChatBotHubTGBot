@@ -1,12 +1,11 @@
 import os
 import logging
 import json
-import asyncio
-from flask import Flask, request, Response
+from aiohttp import web, ClientSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
@@ -15,29 +14,49 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import escape_markdown
-from aiohttp import ClientSession
+import asyncio
 
-# --- Globals & Config ---
-# We define these at the global level so they are accessible throughout the app.
+# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# --- Environment ---
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://xxxx.ngrok-free.app
+LISTEN_PORT = int(os.getenv("PORT", "8443"))
 WEBHOOK_PATH = "/telegram/webhook"
 NOTIFY_WEBHOOK_PATH = "/notify"
 EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
+EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
 
+# --- Conversation States ---
 AUTH_CHOICE, GET_STAFF_EMAIL, GET_STAFF_PASSWORD, GET_OWNER_EMAIL, GET_OWNER_PASSWORD = range(5)
+
+# --- Data Stores ---
+# AUTHORIZED stores telegram_user_id (key) : {"chat_id": telegram_chat_id, "user_id": express_user_id, "token": jwt_token, "email": email}
 AUTHORIZED = {}
+# AUTHENTICATED_STAFF_DETAILS stores telegram_chat_id (key) : {"staff_id": ..., "email": ..., "website_id": ..., "name": ..., "token": ...}
 AUTHENTICATED_STAFF_DETAILS = {}
 
-# --- Telegram Bot Handlers ---
-# (Your handler functions like start, button_callback_handler, get_owner_password, etc., go here)
-# (I've omitted them for brevity, but you must copy all your handler functions into this space)
+if not BOT_TOKEN:
+    logger.error("TELEGRAM_TOKEN environment variable not set. Exiting.")
+    exit(1)
+if not WEBHOOK_URL:
+    logger.error("WEBHOOK_URL environment variable not set. Exiting.")
+    exit(1)
+if not os.getenv("EXPRESS_STAFF_LOGIN_URL"):
+    logger.warning("EXPRESS_STAFF_LOGIN_URL environment variable not set. Using default: %s", EXPRESS_STAFF_LOGIN_URL)
+if not os.getenv("EXPRESS_USER_LOGIN_URL"):
+    logger.warning("EXPRESS_USER_LOGIN_URL environment variable not set. Using default: %s", EXPRESS_USER_LOGIN_URL)
+if not os.getenv("EXPRESS_USER_PROFILE_URL_BASE"):
+    logger.warning("EXPRESS_USER_PROFILE_URL_BASE environment variable not set. Using default: %s", EXPRESS_USER_PROFILE_URL_BASE)
+
+app = None
+
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Handles the /start command. Greets the user and presents authentication options.
@@ -78,6 +97,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     user_id = query.from_user.id
+    chat_id = query.message.chat_id
     data = query.data
 
     if data == "auth_owner":
@@ -85,7 +105,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             f"Okay, let's authenticate you as the *owner*\\. Please send me your *email address* \\.",
             parse_mode=ParseMode.MARKDOWN_V2
         )
-        logger.info(f"User {user.id} ({query.from_user.full_name}) chose owner authentication.")
+        logger.info(f"User {user_id} ({query.from_user.full_name}) chose owner authentication.")
         return GET_OWNER_EMAIL
     
     elif data == "auth_staff":
@@ -93,7 +113,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             f"Okay, let's authenticate you as staff\\. Please send me your *email address* \\.",
             parse_mode=ParseMode.MARKDOWN_V2
         ) 
-        logger.info(f"User {user.id} ({query.from_user.full_name}) chose staff authentication.")
+        logger.info(f"User {user_id} ({query.from_user.full_name}) chose staff authentication.")
         return GET_STAFF_EMAIL
     
     else:
@@ -101,7 +121,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             "Invalid authentication option selected\\. Please use /start again\\.",
             parse_mode=ParseMode.MARKDOWN_V2
         ) 
-        logger.warning(f"User {user.id} ({query.from_user.full_name}) selected invalid callback_data: {data}")
+        logger.warning(f"User {user_id} ({query.from_user.full_name}) selected invalid callback_data: {data}")
         return ConversationHandler.END
 
 async def get_owner_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -294,7 +314,7 @@ async def get_staff_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         parse_mode=ParseMode.MARKDOWN_V2
                     )
                     logger.warning(f"Staff {email} ({user_id}) login failed: {error_message} (Status: {response.status}).")
-                    return GET_STAFF_PASSWORD
+                    return GET_STAFF_EMAIL
 
     except Exception as e:
         logger.exception(f"Error communicating with Express server for staff login from {user_id}: {e}")
@@ -303,7 +323,7 @@ async def get_staff_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Please try again later or contact support\\. You can /cancel this process\\.",
             parse_mode=ParseMode.MARKDOWN_V2
         )
-    return ConversationHandler.END
+        return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
@@ -318,66 +338,177 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info(f"User {user_id} cancelled the authentication process.")
     return ConversationHandler.END
 
-
-# --- Application Factory ---
-def create_app():
+async def handle_notify(request: web.Request):
     """
-    Creates and configures the Flask app and the Telegram bot.
-    This is the function that Gunicorn will call.
+    Handles incoming POST requests to the /notify endpoint.
+    Sends messages to authorized owners and staff based on the request payload.
     """
-    # Create and configure the Flask app
-    app = Flask(__name__)
+    try:
+        data = await request.json()
+        logger.info(f"Received notification request: {data}")
+    except Exception as e:
+        logger.error(f"Invalid JSON in notify request: {e}")
+        return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
 
-    # Create the PTB application instance
-    ptb_app = Application.builder().token(BOT_TOKEN).build()
+    message_text = data.get("message")
+    websiteId = data.get("websiteId", "N/A")
+    notify_owner = data.get("notifyOwner", False) # Flag controlled by sender (main-service)
+    notify_all_staff = data.get("notifyAllStaff", False)
+    owner_id_from_payload = data.get("ownerId") # The backend User _id sent from main-service
 
-    # Define the conversation handler
+    if not message_text:
+        logger.warning("Notification request missing 'message' field.")
+        return web.json_response({"status": "error", "message": "Missing 'message' in payload"}, status=400)
+
+    escaped_message_text = escape_markdown(message_text, version=2)
+    escaped_websiteId = escape_markdown(websiteId, version=2)
+
+    # Message format for both owner and staff
+    full_message = f"💬 New message on website ID: `{escaped_websiteId}`\n`{escaped_message_text}`"
+
+
+    # FIX: Logic to notify owner: Rely solely on notify_owner flag and correct data access
+    if notify_owner and owner_id_from_payload:
+        owner_chat_id_to_notify = None
+        # Iterate AUTHORIZED.values() which gives us the stored info dicts
+        # FIX: Find the owner_info dict by matching the backend user_id (owner_id_from_payload)
+        # to the 'user_id' stored in the owner_info dict.
+        for telegram_user_id_key, owner_info_dict in AUTHORIZED.items(): # Use more descriptive variable names
+            if owner_info_dict.get("user_id") == owner_id_from_payload:
+                owner_chat_id_to_notify = owner_info_dict.get("chat_id")
+                break # Found the owner, break the loop
+        
+        if owner_chat_id_to_notify:
+            try:
+                await app.bot.send_message(owner_chat_id_to_notify, full_message, parse_mode=ParseMode.MARKDOWN_V2)
+                logger.info(f"Message sent to owner Express User ID: {owner_id_from_payload} (Telegram Chat ID: {owner_chat_id_to_notify}) as notifyOwner flag was True.")
+            except Exception as e:
+                logger.error(f"Error sending message to owner {owner_id_from_payload} ({owner_chat_id_to_notify}): {e}")
+        else:
+            logger.warning(f"Notify owner requested (Express User ID: {owner_id_from_payload}), but corresponding Telegram chat_id not found in AUTHORIZED mapping.")
+
+
+    if notify_all_staff:
+        if not AUTHENTICATED_STAFF_DETAILS:
+            logger.warning("Notify all staff requested, but no staff are authenticated.")
+        
+        notified_staff_count = 0
+        for chat_id, staff_info in AUTHENTICATED_STAFF_DETAILS.items():
+            if staff_info.get("website_id") == websiteId:
+                try:
+                    await app.bot.send_message(chat_id, full_message, parse_mode=ParseMode.MARKDOWN_V2)
+                    logger.info(f"Message sent to staff '{staff_info.get('email')}' ({chat_id}) for website {websiteId}.")
+                    notified_staff_count += 1
+                except Exception as e:
+                    logger.error(f"Error sending message to staff {staff_info.get('email')} ({chat_id}): {e}")
+        
+        if notified_staff_count == 0:
+            logger.warning(f"No staff found for website '{websiteId}' to notify, or no staff authenticated at all.")
+
+    return web.json_response({"status": "ok", "message": "Notification processed"})
+
+async def telegram_webhook_handler(request: web.Request):
+    """
+    A custom aiohttp handler to receive Telegram updates and pass them to the PTB application.
+    """
+    global app
+    if app is None:
+        logger.error("Telegram Application is not initialized. Cannot process webhook.")
+        return web.Response(status=500, text="Bot not ready")
+
+    try:
+        update_data = await request.json()
+        logger.debug(f"Received Telegram webhook update: {update_data}")
+        update = Update.de_json(update_data, app.bot)
+        await app.update_queue.put(update)
+        return web.Response(status=200)
+    except json.JSONDecodeError:
+        logger.error("Failed to decode JSON from Telegram webhook request.")
+        return web.Response(status=400, text="Invalid JSON")
+    except Exception as e:
+        logger.exception(f"Error processing Telegram webhook: {e}")
+        return web.Response(status=500, text="Internal Server Error")
+
+# --- Main application setup and execution ---
+async def main():
+    """
+    Main function to set up the Telegram bot and the aiohttp web server.
+    """
+    global app
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(7)
+        .write_timeout(7)
+        .build()
+    )
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            AUTH_CHOICE: [CallbackQueryHandler(button_callback_handler, pattern="^auth_owner$|^auth_staff$")],
-            GET_OWNER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_owner_email)],
-            GET_OWNER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_owner_password)],
-            GET_STAFF_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_staff_email)],
-            GET_STAFF_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_staff_password)],
+            AUTH_CHOICE: [
+                CallbackQueryHandler(button_callback_handler, pattern="^auth_owner$|^auth_staff$")
+            ],
+            GET_OWNER_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_owner_email)
+            ],
+            GET_OWNER_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_owner_password)
+            ],
+            GET_STAFF_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_staff_email)
+            ],
+            GET_STAFF_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_staff_password)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True, allow_reentry=True,
+        per_user=True,
+        allow_reentry=True,
     )
-    ptb_app.add_handler(conv_handler)
-    
-    # Set the webhook in an asyncio task
-    async def setup_bot():
-        try:
-            full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-            await ptb_app.bot.set_webhook(url=full_webhook_url, allowed_updates=Update.ALL_TYPES)
-            logger.info(f"Telegram webhook set successfully to: {full_webhook_url}")
-        except Exception as e:
-            logger.error(f"Failed to set Telegram webhook: {e}")
 
-    # The PTB app needs to be initialized before we can schedule tasks
-    # The webhook setup runs in the background.
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(ptb_app.initialize())
-    loop.create_task(setup_bot())
+    app.add_handler(conv_handler)
 
-    # --- Flask Routes ---
-    @app.route("/")
-    def health_check():
-        return "OK", 200
+    await app.initialize()
+    logger.info("Telegram Application initialized.")
 
-    @app.route(NOTIFY_WEBHOOK_PATH, methods=['POST'])
-    async def handle_notify_route():
-        data = await request.get_json()
-        # ... logic to process notification and send messages with ptb_app.bot ...
-        return {"status": "ok"}
+    full_webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+    logger.info(f"Setting Telegram webhook to: {full_webhook_url}")
+    try:
+        await app.bot.set_webhook(url=full_webhook_url)
+        logger.info("Telegram webhook set successfully.")
+    except Exception as e:
+        logger.error(f"Failed to set Telegram webhook: {e}. Ensure WEBHOOK_URL is reachable.")
+        exit(1)
 
-    @app.route(WEBHOOK_PATH, methods=['POST'])
-    async def telegram_webhook_handler_route():
-        update_data = await request.get_json()
-        update = Update.de_json(update_data, ptb_app.bot)
-        await ptb_app.process_update(update)
-        return Response(status=200)
+    aio_app = web.Application()
+    aio_app.router.add_post(NOTIFY_WEBHOOK_PATH, handle_notify)
+    aio_app.router.add_post(WEBHOOK_PATH, telegram_webhook_handler)
 
-    # Return the configured Flask app
-    return app
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", LISTEN_PORT)
+    await site.start()
+    logger.info(f"Aiohttp server running on http://0.0.0.0:{LISTEN_PORT}")
+
+    await app.start()
+    logger.info("Telegram Application started (listening for updates).")
+
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        logger.info("Application shutdown requested via asyncio.CancelledError.")
+    except KeyboardInterrupt:
+        logger.info("Application shutdown requested by user (KeyboardInterrupt).")
+    finally:
+        logger.info("Stopping Telegram Application and cleaning up web server runner.")
+        await app.stop()
+        await runner.cleanup()
+        logger.info("Application gracefully shut down.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.exception("An unhandled error occurred during application startup or runtime.")
