@@ -31,6 +31,7 @@ NOTIFY_WEBHOOK_PATH = "/notify"
 EXPRESS_STAFF_LOGIN_URL = os.getenv("EXPRESS_STAFF_LOGIN_URL", "http://host.docker.internal:3001/api/staff/login")
 EXPRESS_USER_LOGIN_URL = os.getenv("EXPRESS_USER_LOGIN_URL", "http://host.docker.internal:3001/api/users/login")
 EXPRESS_USER_PROFILE_URL_BASE = os.getenv("EXPRESS_USER_PROFILE_URL_BASE", "http://host.docker.internal:3001/api/users")
+APP_URL = os.getenv("APP_URL", "http://localhost:3000") # New: Base URL for the web application
 
 # --- Conversation States ---
 AUTH_CHOICE, GET_STAFF_EMAIL, GET_STAFF_PASSWORD, GET_OWNER_EMAIL, GET_OWNER_PASSWORD = range(5)
@@ -53,6 +54,8 @@ if not os.getenv("EXPRESS_USER_LOGIN_URL"):
     logger.warning("EXPRESS_USER_LOGIN_URL environment variable not set. Using default: %s", EXPRESS_USER_LOGIN_URL)
 if not os.getenv("EXPRESS_USER_PROFILE_URL_BASE"):
     logger.warning("EXPRESS_USER_PROFILE_URL_BASE environment variable not set. Using default: %s", EXPRESS_USER_PROFILE_URL_BASE)
+if not os.getenv("APP_URL"):
+    logger.warning("APP_URL environment variable not set. Using default: %s", APP_URL)
 
 app = None
 
@@ -82,7 +85,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.message.reply_text(
         f"Hello {user.full_name}\\! 👋\n\n"
-        "Welcome to the notification bot\\. Please choose how you would like to authenticate:",
+        "Welcome to the notification bot\\. Please choose how you would like to authenticate\\:",
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -314,7 +317,7 @@ async def get_staff_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         parse_mode=ParseMode.MARKDOWN_V2
                     )
                     logger.warning(f"Staff {email} ({user_id}) login failed: {error_message} (Status: {response.status}).")
-                    return GET_STAFF_EMAIL
+                    return GET_STAFF_PASSWORD
 
     except Exception as e:
         logger.exception(f"Error communicating with Express server for staff login from {user_id}: {e}")
@@ -341,7 +344,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def handle_notify(request: web.Request):
     """
     Handles incoming POST requests to the /notify endpoint.
-    Sends messages to authorized owners and staff based on the request payload.
+    Sends messages to authorized owners and staff based on the request payload,
+    including a "Go To Chat" button.
     """
     try:
         data = await request.json()
@@ -352,13 +356,20 @@ async def handle_notify(request: web.Request):
 
     message_text = data.get("message")
     websiteId = data.get("websiteId", "N/A")
-    notify_owner = data.get("notifyOwner", False) # Flag controlled by sender (main-service)
+    chatId = data.get("chatId") # New: chat ID for linking to the specific conversation
+    notify_owner = data.get("notifyOwner", False)
     notify_all_staff = data.get("notifyAllStaff", False)
-    owner_id_from_payload = data.get("ownerId") # The backend User _id sent from main-service
+    owner_id_from_payload = data.get("ownerId")
 
     if not message_text:
         logger.warning("Notification request missing 'message' field.")
         return web.json_response({"status": "error", "message": "Missing 'message' in payload"}, status=400)
+    
+    if not chatId:
+        logger.warning("Notification request missing 'chatId' field. Cannot create 'Go To Chat' link.")
+        # Proceed without the button if chatId is missing, or return error if it's crucial
+        return web.json_response({"status": "error", "message": "Missing 'chatId' in payload"}, status=400)
+
 
     escaped_message_text = escape_markdown(message_text, version=2)
     escaped_websiteId = escape_markdown(websiteId, version=2)
@@ -367,27 +378,28 @@ async def handle_notify(request: web.Request):
     full_message = f"💬 New message on website ID: `{escaped_websiteId}`\n`{escaped_message_text}`"
 
 
-    # FIX: Logic to notify owner: Rely solely on notify_owner flag and correct data access
+    # Notify owner
     if notify_owner and owner_id_from_payload:
         owner_chat_id_to_notify = None
-        # Iterate AUTHORIZED.values() which gives us the stored info dicts
-        # FIX: Find the owner_info dict by matching the backend user_id (owner_id_from_payload)
-        # to the 'user_id' stored in the owner_info dict.
-        for telegram_user_id_key, owner_info_dict in AUTHORIZED.items(): # Use more descriptive variable names
+        for telegram_user_id_key, owner_info_dict in AUTHORIZED.items():
             if owner_info_dict.get("user_id") == owner_id_from_payload:
                 owner_chat_id_to_notify = owner_info_dict.get("chat_id")
-                break # Found the owner, break the loop
+                break
         
         if owner_chat_id_to_notify:
             try:
-                await app.bot.send_message(owner_chat_id_to_notify, full_message, parse_mode=ParseMode.MARKDOWN_V2)
-                logger.info(f"Message sent to owner Express User ID: {owner_id_from_payload} (Telegram Chat ID: {owner_chat_id_to_notify}) as notifyOwner flag was True.")
+                owner_chat_link = f"{APP_URL}/websites/{websiteId}/conversations?chatId={chatId}"
+                owner_keyboard = [[InlineKeyboardButton("Go To Chat", url=owner_chat_link)]]
+                owner_reply_markup = InlineKeyboardMarkup(owner_keyboard)
+                await app.bot.send_message(owner_chat_id_to_notify, full_message, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=owner_reply_markup)
+                logger.info(f"Message sent to owner Express User ID: {owner_id_from_payload} (Telegram Chat ID: {owner_chat_id_to_notify}) with 'Go To Chat' button.")
             except Exception as e:
                 logger.error(f"Error sending message to owner {owner_id_from_payload} ({owner_chat_id_to_notify}): {e}")
         else:
             logger.warning(f"Notify owner requested (Express User ID: {owner_id_from_payload}), but corresponding Telegram chat_id not found in AUTHORIZED mapping.")
 
 
+    # Notify all staff for the relevant website
     if notify_all_staff:
         if not AUTHENTICATED_STAFF_DETAILS:
             logger.warning("Notify all staff requested, but no staff are authenticated.")
@@ -396,8 +408,11 @@ async def handle_notify(request: web.Request):
         for chat_id, staff_info in AUTHENTICATED_STAFF_DETAILS.items():
             if staff_info.get("website_id") == websiteId:
                 try:
-                    await app.bot.send_message(chat_id, full_message, parse_mode=ParseMode.MARKDOWN_V2)
-                    logger.info(f"Message sent to staff '{staff_info.get('email')}' ({chat_id}) for website {websiteId}.")
+                    staff_chat_link = f"{APP_URL}/staff/dashboard?chatId={chatId}"
+                    staff_keyboard = [[InlineKeyboardButton("Go To Chat", url=staff_chat_link)]]
+                    staff_reply_markup = InlineKeyboardMarkup(staff_keyboard)
+                    await app.bot.send_message(chat_id, full_message, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=staff_reply_markup)
+                    logger.info(f"Message sent to staff '{staff_info.get('email')}' ({chat_id}) for website {websiteId} with 'Go To Chat' button.")
                     notified_staff_count += 1
                 except Exception as e:
                     logger.error(f"Error sending message to staff {staff_info.get('email')} ({chat_id}): {e}")
